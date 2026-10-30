@@ -1,6 +1,12 @@
 ## History / Changelog
 
 
+## Unreleased
+
+- CLI fixes: exit codes, argument checks, input lists and link discovery by @adbar
+- Python API: `ValueError` for unknown output formats, `url` argument applies with `options` by @adbar
+
+
 ## 2.3.1
 
 - Fewer duplicated segments in the output and a new test series by @adbar (#955)

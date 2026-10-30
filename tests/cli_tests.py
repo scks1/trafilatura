@@ -8,9 +8,13 @@ import logging
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
+import sysconfig
+import threading
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from os import path
 from pathlib import Path
 from tempfile import gettempdir
@@ -25,6 +29,8 @@ from trafilatura.utils import LANGID_FLAG
 
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 RESOURCES_DIR = path.join(path.abspath(path.dirname(__file__)), "resources")
+# the entry point next to the running interpreter, even if its directory is not on PATH
+TRAFILATURA_BIN = shutil.which("trafilatura", path=sysconfig.get_path("scripts")) or "trafilatura"
 
 
 def test_random_filenames_leave_callers_random_state_unchanged(tmp_path):
@@ -89,14 +95,14 @@ def test_parser(tmp_path):
     testargs = [
         "",
         "-i",
-        "resources/list-discard.txt",
+        path.join(RESOURCES_DIR, "list-discard.txt"),
         "--url-filter",
         "test1",
         "test2",
         "-vvv",
     ]
     args = cli.parse_args(testargs[1:])
-    assert args.input_file == "resources/list-discard.txt"
+    assert args.input_file == path.join(RESOURCES_DIR, "list-discard.txt")
     assert args.url_filter == ["test1", "test2"]
     args.input_file = path.join(RESOURCES_DIR, "list-discard.txt")
     args.blacklist = path.join(RESOURCES_DIR, "list-discard.txt")
@@ -144,6 +150,62 @@ def test_url_filenames_reject_incompatible_inputs(extra_args, capsys):
         cli.parse_args(["--name-from-url", "-o", "output", *extra_args])
     assert exc.value.code == 2
     assert "--name-from-url requires" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("option", ["--feed", "--sitemap", "--crawl", "--explore", "--probe"])
+def test_navigation_args(option, capsys):
+    "A navigation option needs a URL and excludes --input-dir."
+    for argv, message in (
+        ([option], "requires a URL"),
+        ([option, ""], "requires a URL"),
+        ([option, "https://example.org", "--input-dir", "input"], "cannot be combined with --input-dir"),
+        ([option, "https://example.org", "-u", "https://example.net"], "give the URL once"),
+        ([option, "", "-u", "https://example.net"], "give the URL once"),
+        ([option, "https://example.org", "-i", "tests/resources/list-process.txt"], "give the URL once"),
+    ):
+        with pytest.raises(SystemExit) as exc:
+            cli.parse_args(argv)
+        assert exc.value.code == 2
+        assert message in capsys.readouterr().err
+    args = cli.parse_args([option, "https://example.org"])
+    assert args.URL == "https://example.org"
+    assert getattr(args, option[2:]) is True
+    args = cli.parse_args([option, "-u", "https://example.org"])
+    assert args.URL == "https://example.org"
+
+
+@pytest.mark.parametrize("filters", [["-b", "blacklist"], ["--url-filter", "/news/"]])
+@pytest.mark.parametrize(
+    "option, fetcher, func",
+    [("--crawl", "buffered_response_downloads", "cli_crawler"), ("--probe", "buffered_downloads", "probe_homepage")],
+)
+def test_seed_filters(tmp_path, filters, option, fetcher, func, capsys):
+    "Crawler and probe start URLs go through the blacklist and URL filter."
+    (tmp_path / "blacklist").write_text("https://example.org/start\n", encoding="utf-8")
+    filters = [str(tmp_path / f) if f == "blacklist" else f for f in filters]
+    args = cli.parse_args([option, "https://example.org/start", *filters])
+    args.blacklist = cli_utils.load_blacklist(args.blacklist) if args.blacklist else None
+    with patch.object(cli_utils, fetcher, return_value=[]) as fetch:
+        assert getattr(cli_utils, func)(args) == 0
+    assert all(not c.args[0] for c in fetch.call_args_list)
+    assert not capsys.readouterr().out.strip()
+
+
+@pytest.mark.parametrize(
+    "errors, archived_errors, expected",
+    [([], [], 0), (["https://example.org/a"], [], 0), (["https://example.org/a"], ["archived"], 126)],
+)
+def test_archived_retry_exit_code(errors, archived_errors, expected):
+    args = cli.parse_args(["-u", "https://example.org/a", "--archived"])
+    url_store = add_to_compressed_dict(["https://example.org/a", "https://example.org/b"])
+    results = iter([(errors, -1), (archived_errors, -1)])
+    with patch.object(cli_utils, "download_queue_processing", side_effect=lambda *a: next(results)) as download:
+        assert cli_utils.url_processing_pipeline(args, url_store) == expected
+    assert download.call_count == (2 if errors else 1)
+    if errors:
+        (archived,) = download.call_args.args[0].dump_urls()
+        assert archived.startswith("https://web.archive.org/web/20/")
+        assert archived.endswith("example.org/a")
 
 
 def test_url_filenames_require_output_dir(capsys):
@@ -264,12 +326,7 @@ def test_args_to_extractor_kwargs():
 def test_climain(capfd):
     """test arguments and main CLI entrypoint"""
     # exit status required: 0
-    # Windows platforms
-    if os.name == "nt":
-        trafilatura_bin = path.join(sys.prefix, "Scripts", "trafilatura")
-    # other platforms
-    else:
-        trafilatura_bin = "trafilatura"
+    trafilatura_bin = TRAFILATURA_BIN
     # help display
     assert subprocess.run([trafilatura_bin, "--help"], check=True).returncode == 0
     # piped input
@@ -290,6 +347,109 @@ def test_climain(capfd):
     assert subprocess.run([trafilatura_bin], input=compressed_input, check=True).returncode == 0
     captured = capfd.readouterr()
     assert captured.out.strip().endswith("in deep-red West Virginia.")
+
+
+PAGE = (
+    "<html><body><article>"
+    + "".join(f"<p>Paragraph {i} " + "word " * 40 + "</p>" for i in range(5))
+    + "</article></body></html>"
+)
+
+
+class _PageHandler(BaseHTTPRequestHandler):
+    def _reply(self, body):
+        self.send_response(200 if self.path.startswith("/ok") else 404)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        if body and self.path.startswith("/ok"):
+            self.wfile.write(PAGE.encode())
+
+    def do_GET(self):
+        self._reply(True)
+
+    def do_HEAD(self):
+        self._reply(False)
+
+    def log_message(self, *_args):
+        pass
+
+
+@pytest.fixture(scope="module")
+def exit_code_setup(tmp_path_factory):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _PageHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    tmp = tmp_path_factory.mktemp("exit")
+    (tmp / "cfg").write_text("[DEFAULT]\nSSRF_PROTECTION = off\nSLEEP_TIME = 0\nDOWNLOAD_TIMEOUT = 5\n")
+    for name, paths in (("partial", ["ok1", "dead1"]), ("dead", ["dead1", "dead2"]), ("empty", [])):
+        (tmp / name).write_text("".join(f"{base}/{p}\n" for p in paths))
+    # nothing listens on port 1: a second, unreachable host
+    (tmp / "twohosts").write_text(f"{base}/ok\nhttp://127.0.0.1:1/\n")
+    (tmp / "header").write_text(f"# my sites\n{base}/ok\n")
+    (tmp / "in").mkdir()
+    (tmp / "in" / "a.html").write_text(PAGE)
+    (tmp / "blocker").write_text("")
+    yield base, tmp
+    server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "argv, stdin, expected",
+    [
+        (["-u", "{base}/ok"], None, 0),
+        (["-u", "{base}/dead"], None, 126),
+        (["-i", "{tmp}/partial"], None, 1),
+        (["-i", "{tmp}/dead"], None, 126),
+        (["-i", "{tmp}/empty"], None, 0),
+        (["-i", "{tmp}/missing"], None, 2),
+        (["--input-dir", "{tmp}/in"], None, 0),
+        (["--input-dir", "{tmp}/missing"], None, 1),
+        (["--input-dir", "{tmp}/in", "-o", "{tmp}/blocker/out"], None, 1),
+        (["--input-dir", "{tmp}/in", "--list", "-o", "{tmp}/blocker/out"], None, 1),
+        ([], PAGE.encode(), 0),
+        ([], b"<p>x</p>", 0),
+        (["--crawl", "{base}/ok"], None, 0),
+        (["--crawl", "{base}/dead"], None, 126),
+        (["--probe", "{base}/ok"], None, 0),
+        (["--probe", "{base}/dead"], None, 126),
+        (["--crawl", "-i", "{tmp}/twohosts"], None, 1),
+        (["--probe", "-i", "{tmp}/twohosts"], None, 1),
+        (["--probe", "-i", "{tmp}/header"], None, 0),
+        (["--feed", "{base}/dead"], None, 126),
+        (["--explore", "{base}/dead"], None, 126),
+    ],
+    ids=[
+        "url",
+        "url-404",
+        "list-partial",
+        "list-dead",
+        "list-empty",
+        "list-missing",
+        "input-dir",
+        "input-dir-missing",
+        "output-unwritable",
+        "output-unwritable-list",
+        "stdin",
+        "stdin-rejected",
+        "crawl",
+        "crawl-dead",
+        "probe",
+        "probe-dead",
+        "crawl-partial",
+        "probe-partial",
+        "probe-header",
+        "feed-dead",
+        "explore-dead",
+    ],
+)
+def test_cli_exit_codes(exit_code_setup, argv, stdin, expected):
+    "The real CLI exit codes: 0 success, 1 some errors, 126 almost all inputs failed, 2 invalid arguments."
+    base, tmp = exit_code_setup
+    args = [arg.format(base=base, tmp=tmp) for arg in argv]
+    if stdin is None:
+        args += ["--config-file", str(tmp / "cfg")]
+    result = subprocess.run([TRAFILATURA_BIN, *args], input=stdin, capture_output=True, timeout=60)
+    assert result.returncode == expected, result.stderr.decode()[-300:]
 
 
 def test_input_type():
@@ -390,9 +550,9 @@ def test_sysoutput():
     assert cli_utils.process_result(teststring, args, 1, options) == 2
 
     # test keeping dir structure
-    testargs = ["", "-i", "myinputdir/", "-o", "test/", "--keep-dirs"]
+    testargs = ["", "--input-dir", "myinputdir/", "-o", "test/", "--keep-dirs"]
     args = cli.parse_args(testargs[1:])
-    filepath, destdir = cli_utils.determine_output_path(args, "testfile.txt", "")
+    filepath, destdir = cli_utils.determine_output_path(args, "myinputdir/testfile.txt", "")
     assert filepath == path.join("test", "testfile.txt")
     # test hash as output file name
     assert args.keep_dirs is True
@@ -641,7 +801,7 @@ def test_file_processing(tmp_path):
 
 def test_cli_config_file():
     "Test if the configuration file is loaded correctly from the CLI."
-    testargs = ["", "--input-dir", "/dev/null", "--config-file", "newsettings.cfg"]
+    testargs = ["", "--input-dir", "/dev/null", "--config-file", path.join(RESOURCES_DIR, "newsettings.cfg")]
     args = cli.parse_args(testargs[1:])
     with open(path.join(RESOURCES_DIR, "httpbin_sample.html"), encoding="utf-8") as f:
         teststring = f.read()
@@ -725,10 +885,6 @@ def test_input_filtering():
 def test_crawling():
     "Test crawling and exploration functions."
 
-    testargs = ["", "--crawl", ""]
-    args = cli.parse_args(testargs[1:])
-    cli_utils.cli_crawler(args)
-
     testargs = ["", "--crawl", " "]
     args = cli.parse_args(testargs[1:])
     cli_utils.cli_crawler(args)
@@ -761,7 +917,7 @@ def test_crawling():
     )
     spider.URL_STORE = UrlStore(compressed=False, strict=False)
     # 0 links permitted
-    args.crawl = "https://httpbun.com/links/4/4"
+    args.URL = "https://httpbun.com/links/4/4"
     f = io.StringIO()
     with redirect_stdout(f):
         cli_utils.cli_crawler(args, n=0)
@@ -835,3 +991,122 @@ def test_keep_dirs_local_batch(tmp_path, monkeypatch, relative_input):
         expected = output_dir / relative_path.with_suffix(".txt")
         assert output_path == str(expected)
         assert destination_dir == str(expected.parent)
+
+
+@pytest.mark.parametrize("option", ["-o", "--backup-dir"])
+def test_unwritable_output_dir_exit_code(tmp_path, option):
+    (tmp_path / "input").mkdir()
+    (tmp_path / "blocker").write_text("")
+    args = cli.parse_args(["--input-dir", str(tmp_path / "input"), option, str(tmp_path / "blocker" / "out")])
+    with pytest.raises(SystemExit) as exc:
+        cli.process_args(args)
+    assert exc.value.code == 1
+
+
+@pytest.mark.parametrize("option, func", [("--crawl", "cli_crawler"), ("--probe", "probe_homepage")])
+def test_printing_modes_create_no_output_dir(tmp_path, option, func):
+    with patch.object(cli, func, return_value=0):
+        cli.process_args(cli.parse_args([option, "https://example.org/", "-o", str(tmp_path / "out")]))
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_stdin_rejected(capsys):
+    with patch("sys.stdin") as mock_stdin:
+        mock_stdin.buffer.read.return_value = b"<p>x</p>"
+        cli.process_args(cli.parse_args([]))
+    assert "ERROR: file size" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv, message",
+    [
+        (["-i", "missing.txt"], "-i/--input-file: file not found"),
+        (["-u", "https://example.org", "-b", "missing.txt"], "-b/--blacklist: file not found"),
+        (["-u", "https://example.org", "--config-file", "missing.cfg"], "--config-file: file not found"),
+        (["-i", "."], "-i/--input-file: file not found"),
+        (["--input-dir", ".", "--parallel", "0"], "--parallel must be a positive integer"),
+        (["-u", "https://example.org", "-o", "out", "--keep-dirs"], "--keep-dirs requires --input-dir"),
+    ],
+    ids=["input-file", "blacklist", "config-file", "directory", "parallel", "keep-dirs-urls"],
+)
+def test_invalid_args_exit_code(tmp_path, monkeypatch, capsys, argv, message):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(argv)
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_input_file_first_token(tmp_path):
+    urls = tmp_path / "urls.txt"
+    urls.write_text("https://example.org/a some note\n\n  https://example.org/b\tnote\n", encoding="utf-8")
+    args = cli.parse_args(["-i", str(urls)])
+    assert cli_utils.load_input_urls(args) == ["https://example.org/a", "https://example.org/b"]
+
+
+def test_keep_dirs_strips_extensions(tmp_path):
+    args = cli.parse_args(["--input-dir", str(tmp_path), "-o", str(tmp_path / "out"), "--keep-dirs"])
+    for name, expected in (
+        ("B.HTML", "B.txt"),
+        ("c.html.gz", "c.txt"),
+        ("v1.2.htm", "v1.2.txt"),
+        ("a.gz", "a.txt"),
+        ("d.tar.gz", "d.txt"),
+    ):
+        output_path, _ = cli_utils.determine_output_path(args, str(tmp_path / name), "")
+        assert Path(output_path).name == expected
+
+
+def test_list_input_dir_notice(capsys):
+    cli.parse_args(["--input-dir", ".", "--list"])
+    assert "--list has no effect on --input-dir" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("list_mode", [False, True], ids=["extract", "list"])
+def test_discovery_processes_found_urls_only(list_mode, capsys):
+    found = ["https://example.org/news/a", "https://example.org/news/b"]
+    processed = []
+    with (
+        patch.object(cli_utils, "sitemap_search", lambda url, **kwargs: found),
+        patch.object(cli_utils, "url_processing_pipeline", lambda args, store: processed.extend(store.dump_urls()) or 0),
+    ):
+        argv = ["--sitemap", "https://example.org/sitemap.xml"] + (["--list"] if list_mode else [])
+        assert cli_utils.cli_discovery(cli.parse_args(argv)) == 0
+    assert sorted(processed + capsys.readouterr().out.split()) == found
+
+
+@pytest.mark.parametrize("option", ["--feed", "--sitemap"])
+@pytest.mark.parametrize("found, expected", [({}, 126), ({"https://a.org/": ["https://a.org/x"]}, 1)])
+def test_discovery_without_links_exit_code(tmp_path, option, found, expected):
+    (tmp_path / "seeds").write_text("https://a.org/\nhttps://b.org/\n", encoding="utf-8")
+    search = "find_feed_urls" if option == "--feed" else "sitemap_search"
+    with (
+        patch.object(cli_utils, search, lambda url, **kwargs: found.get(url, [])),
+        patch.object(cli_utils, "url_processing_pipeline", lambda args, store: 0),
+    ):
+        assert cli_utils.cli_discovery(cli.parse_args([option, "-i", str(tmp_path / "seeds")])) == expected
+
+
+def test_url_filter_discarding_all_inputs(caplog):
+    with patch.object(cli_utils, "sitemap_search") as search:
+        cli_utils.cli_discovery(cli.parse_args(["--sitemap", "https://example.org/", "--url-filter", "/news/"]))
+    search.assert_not_called()
+    assert "No input URL left" in caplog.text
+
+
+def test_config_file_with_bom(tmp_path):
+    conf = tmp_path / "bom.cfg"
+    conf.write_text("[DEFAULT]\nMIN_OUTPUT_SIZE = 12345\n", encoding="utf-8-sig")
+    assert settings.use_config(str(conf)).getint("DEFAULT", "MIN_OUTPUT_SIZE") == 12345
+
+
+@pytest.mark.parametrize("list_mode", [False, True], ids=["extract", "list"])
+def test_explore_crawls_sites_without_sitemap(list_mode):
+    crawled = []
+    with (
+        patch.object(cli_utils, "sitemap_search", lambda url, **kwargs: []),
+        patch.object(cli_utils, "url_processing_pipeline", lambda args, store: 0),
+        patch.object(cli_utils, "cli_crawler", lambda args, url_store, options: crawled.extend(url_store.dump_urls()) or 0),
+    ):
+        cli_utils.cli_discovery(cli.parse_args(["--explore", "https://example.org/"] + (["--list"] if list_mode else [])))
+    assert crawled == ["https://example.org/"]
