@@ -51,6 +51,7 @@ from trafilatura.readability_lxml import is_probably_readerable
 from trafilatura.settings import MANUALLY_CLEANED, TAG_CATALOG, use_config
 from trafilatura.utils import (
     LANGID_FLAG,
+    _relocate_head_content,
     detect_encoding,
     is_dubious_html,
     is_image_file,
@@ -387,12 +388,32 @@ def test_stranded_text_moves_with_the_elements():
     "non-whitespace text stranded in <head> keeps its document position"
     tree = load_html(_implied_head_doc(f"Loose lead text<main>{_PARA}</main>"))
     body = tree.find("body")
-    assert body.text == "Loose lead text"
-    assert body.text_content().index("Loose lead text") < body.text_content().index("Alpha body")
+    # where the text ends up depends on the libxml2 version doing the
+    # parsing: libxml2 2.14+ closes the head at the text and makes it the
+    # body's leading text, while older versions (e.g. 2.11.9, bundled in
+    # lxml's Windows wheels) wrap it in an implied <p> inside the body.
+    # Either way it must stay ahead of the article text.
+    text = body.text_content()
+    assert text.startswith("Loose lead text")
+    assert text.index("Loose lead text") < text.index("Alpha body")
 
     tree = load_html(_implied_head_doc(f"<header>Site header</header>Middle text<main>{_PARA}</main>"))
     text = tree.find("body").text_content()
     assert text.index("Site header") < text.index("Middle text") < text.index("Alpha body")
+
+
+def test_relocate_head_content_stranded_text():
+    "the repair itself, on a hand-built tree: stranded text becomes the body's leading text"
+    # built with the XML parser so the tree shape does not depend on
+    # which libxml2 HTML parser happens to be installed
+    tree = etree.fromstring(
+        f'<html><head><meta charset="utf-8"/><title>Some title</title>Loose lead text<main>{_PARA}</main></head></html>'
+    )
+    _relocate_head_content(tree)
+    body = tree.find("body")
+    assert body.text == "Loose lead text"
+    assert [child.tag for child in body] == ["main"]
+    assert [child.tag for child in tree.find("head")] == ["meta", "title"]
 
 
 def test_extract_recovers_implied_head_article():
